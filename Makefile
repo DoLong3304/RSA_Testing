@@ -27,7 +27,7 @@ CFLAGS += $(GMP_CFLAGS)
 LDFLAGS += $(GMP_LIBS)
 
 # Source and object files
-SOURCES = main.c rsa.c
+SOURCES = main.c rsa.c test_module.c
 OBJECTS = $(SOURCES:.c=.o)
 
 # Default target

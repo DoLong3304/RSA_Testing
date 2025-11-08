@@ -5,7 +5,8 @@ set(CMAKE_C_STANDARD 17)
 
 add_executable(RSA main.c
         rsa.h
-        rsa.c)
+        rsa.c
+        test_module.c)
 
 # Try to locate GMP via pkg-config first, then fall back to common Homebrew paths
 find_package(PkgConfig QUIET)
