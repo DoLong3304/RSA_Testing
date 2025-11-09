@@ -6,6 +6,15 @@
 #include "rsa.h"
 #include "test_module.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <direct.h>
+#define MKDIR_DIR(path) _mkdir(path)
+#else
+#include <unistd.h>
+#define MKDIR_DIR(path) mkdir(path, 0700)
+#endif
+
 #define MAX_PATH_LEN 256
 #define DEFAULT_BIT_LEN 2048
 #define KEYS_DIR "keys"
@@ -33,6 +42,13 @@ void handle_test_bruteforce_interactive();
 void run_interactive_mode();
 void print_usage(const char *prog_name);
 
+static long safe_strtol(const char *s) {
+    char *end=NULL;
+    long v=strtol(s,&end,10);
+    if(end&&*end!='\0'&&*end!='\n') return -1;
+    return v;
+}
+
 int main(int argc, char *argv[]) {
     if (argc == 1) {
         run_interactive_mode();
@@ -41,9 +57,7 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(argv[1], "generate") == 0) {
         int bit_length = DEFAULT_BIT_LEN;
-        if (argc > 2) {
-            bit_length = atoi(argv[2]);
-        }
+        if (argc > 2) { long v=safe_strtol(argv[2]); if(v>0) bit_length=(int)v; }
         if (bit_length <= 0) {
             fprintf(stderr, "Invalid bit length.\n");
             return 1;
@@ -95,22 +109,24 @@ int main(int argc, char *argv[]) {
         const char *sub = argv[2];
         if (strcmp(sub, "bulk") == 0) {
             if (argc < 5) { fprintf(stderr, "Usage: %s test bulk <min_bits> <max_bits>\n", argv[0]); return 1; }
-            int min_bits = atoi(argv[3]); int max_bits = atoi(argv[4]);
+            int min_bits = (int)safe_strtol(argv[3]); int max_bits = (int)safe_strtol(argv[4]);
             test_bulk_keys(min_bits, max_bits);
             return 0;
         } else if (strcmp(sub, "integrity") == 0) {
             if (argc < 4) { fprintf(stderr, "Usage: %s test integrity <file> [bits]\n", argv[0]); return 1; }
-            const char *file = argv[3]; int bits = -1; if (argc >= 5) bits = atoi(argv[4]);
+            const char *file = argv[3]; int bits = -1; if (argc >= 5) { long v=safe_strtol(argv[4]); if(v>0) bits=(int)v; }
             return test_integrity(file, bits);
         } else if (strcmp(sub, "speed") == 0) {
             if (argc < 6) { fprintf(stderr, "Usage: %s test speed <file> <min_bits> <max_bits>\n", argv[0]); return 1; }
-            const char *file = argv[3]; int min_bits = atoi(argv[4]); int max_bits = atoi(argv[5]);
+            const char *file = argv[3]; int min_bits = (int)safe_strtol(argv[4]); int max_bits = (int)safe_strtol(argv[5]);
             test_speed(file, min_bits, max_bits); return 0;
         } else if (strcmp(sub, "bruteforce") == 0) {
-            if (argc < 6) { fprintf(stderr, "Usage: %s test bruteforce <file> <min_bits> <max_bits> [limit_seconds]\n", argv[0]); return 1; }
-            const char *file = argv[3]; int min_bits = atoi(argv[4]); int max_bits = atoi(argv[5]);
-            int limit_seconds = LIMIT_SECONDS; if (argc >= 7) limit_seconds = atoi(argv[6]);
-            test_bruteforce(file, min_bits, max_bits, limit_seconds); return 0;
+            if (argc < 6) { fprintf(stderr, "Usage: %s test bruteforce <file> <min_bits> <max_bits> [limit_seconds] [algorithm]\n", argv[0]); return 1; }
+            const char *file = argv[3]; int min_bits = (int)safe_strtol(argv[4]); int max_bits = (int)safe_strtol(argv[5]);
+            int limit_seconds = LIMIT_SECONDS; const char *algo = "auto";
+            if (argc >= 7) { long v=safe_strtol(argv[6]); if(v>0) limit_seconds=(int)v; }
+            if (argc >= 8) algo = argv[7];
+            test_bruteforce(file, min_bits, max_bits, limit_seconds, algo); return 0;
         } else {
             fprintf(stderr, "Unknown test subcommand '%s'.\n", sub); print_usage(argv[0]); return 1;
         }
@@ -131,7 +147,7 @@ static int ensure_keys_dir() {
         }
         return 0;
     }
-    if (mkdir(KEYS_DIR, 0700) != 0) {
+    if (MKDIR_DIR(KEYS_DIR) != 0) {
         perror("Failed to create keys directory");
         return -1;
     }
@@ -162,18 +178,37 @@ static int parse_bits_from_filename(const char *name) {
 }
 
 static int find_latest_key_bits() {
+#if defined(_WIN32)
+    char pattern[MAX_PATH_LEN];
+    snprintf(pattern, sizeof(pattern), "%s\\*.key", KEYS_DIR);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    int latest_bits = -1;
+    do {
+        const char *name = fd.cFileName;
+        if (strncmp(name, "public_", 7)==0 || strncmp(name, "private_", 8)==0) {
+            int bits = parse_bits_from_filename(name);
+            if (bits > latest_bits) latest_bits = bits;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return latest_bits;
+#else
     DIR *dir = opendir(KEYS_DIR);
     if (!dir) return -1;
     struct dirent *entry;
     int latest_bits = -1;
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_REG) {
-            int bits = parse_bits_from_filename(entry->d_name);
+        const char *name = entry->d_name;
+        if (strncmp(name, "public_", 7)==0 || strncmp(name, "private_", 8)==0) {
+            int bits = parse_bits_from_filename(name);
             if (bits > latest_bits) latest_bits = bits;
         }
     }
     closedir(dir);
     return latest_bits;
+#endif
 }
 
 static void build_key_paths(int bits, char *pub_path, char *priv_path, size_t sz) {
@@ -305,14 +340,16 @@ int do_file_decryption(const char *input_path, const char *output_path, int key_
 // --- Interactive UI and Handler Functions ---
 void run_interactive_mode() {
     int choice = 0;
+    char choice_buf[16];
     while (1) {
         print_menu();
-        if (scanf("%d", &choice) != 1) {
-            while (getchar() != '\n');
+        if (!fgets(choice_buf, sizeof(choice_buf), stdin)) return;
+        long v = safe_strtol(choice_buf);
+        if (v < 1 || v > 8) {
             printf("Invalid input. Please enter a number.\n\n");
             continue;
         }
-        while (getchar() != '\n');
+        choice = (int)v;
         switch (choice) {
             case 1: handle_key_generation_interactive(); break;
             case 2: handle_file_encryption_interactive(); break;
@@ -352,19 +389,14 @@ void print_usage(const char *prog_name) {
     printf("  %s test bulk <min_bits> <max_bits>           : Generate multiple key pairs (powers of two).\n", prog_name);
     printf("  %s test integrity <file> [bits]              : Encrypt/decrypt and verify match.\n", prog_name);
     printf("  %s test speed <file> <min_bits> <max_bits>   : Measure performance across bit sizes.\n", prog_name);
-    printf("  %s test bruteforce <file> <min_bits> <max_bits> [limit_seconds] : Attempt naive factoring within time limit per key.\n", prog_name);
+    printf("  %s test bruteforce <file> <min_bits> <max_bits> [limit_seconds] [algorithm] : Attempt factoring (algo: auto|trial|rho|p1).\n", prog_name);
 }
 
 void handle_key_generation_interactive() {
     char bit_len_str[32];
     int bit_length = DEFAULT_BIT_LEN;
     printf("Enter key bit length (default %d): ", DEFAULT_BIT_LEN);
-    if (fgets(bit_len_str, sizeof(bit_len_str), stdin)) {
-        if (strlen(bit_len_str) > 1) {
-            int tmp = atoi(bit_len_str);
-            if (tmp > 0) bit_length = tmp;
-        }
-    }
+    if (fgets(bit_len_str, sizeof(bit_len_str), stdin)) { long v=safe_strtol(bit_len_str); if (v>0) bit_length=(int)v; }
     do_key_generation(bit_length);
 }
 
@@ -381,10 +413,7 @@ void handle_file_encryption_interactive() {
     if (!fgets(bits_str, sizeof(bits_str), stdin)) return;
 
     int bits = -1;
-    if (strlen(bits_str) > 1) {
-        int tmp = atoi(bits_str);
-        if (tmp > 0) bits = tmp;
-    }
+    if (strlen(bits_str) > 1) { long v=safe_strtol(bits_str); if(v>0) bits=(int)v; }
 
     printf("Enter output filename (leave empty for auto .dat): ");
     if (!fgets(out_file, sizeof(out_file), stdin)) return;
@@ -406,10 +435,7 @@ void handle_file_decryption_interactive() {
     printf("Enter key bits to use (leave empty for latest): ");
     if (!fgets(bits_str, sizeof(bits_str), stdin)) return;
     int bits = -1;
-    if (strlen(bits_str) > 1) {
-        int tmp = atoi(bits_str);
-        if (tmp > 0) bits = tmp;
-    }
+    if (strlen(bits_str) > 1) { long v=safe_strtol(bits_str); if(v>0) bits=(int)v; }
 
     printf("Enter output filename (leave empty for auto *_decrypted): ");
     if (!fgets(out_file, sizeof(out_file), stdin)) return;
@@ -421,18 +447,9 @@ void handle_file_decryption_interactive() {
 
 void handle_test_bulk_interactive() {
     int min_bits, max_bits;
-    printf("Enter min bit length: ");
-    if (scanf("%d", &min_bits) != 1) {
-        while (getchar()!='\n') {}
-        printf("Invalid.\n");
-        return;
-    }
-    printf("Enter max bit length: ");
-    if (scanf("%d", &max_bits) != 1) {
-        while (getchar()!='\n') {}
-        printf("Invalid.\n");
-        return;
-    }
+    char min_buf[32], max_buf[32];
+    printf("Enter min bit length: "); if(!fgets(min_buf,sizeof(min_buf),stdin)) return; long mv=safe_strtol(min_buf); if(mv<=0){printf("Invalid.\n"); return;} min_bits=(int)mv;
+    printf("Enter max bit length: "); if(!fgets(max_buf,sizeof(max_buf),stdin)) return; long xv=safe_strtol(max_buf); if(xv<=0){printf("Invalid.\n"); return;} max_bits=(int)xv;
     while (getchar()!='\n') {}
     test_bulk_keys(min_bits, max_bits);
 }
@@ -441,39 +458,27 @@ void handle_test_integrity_interactive() {
     char path[MAX_PATH_LEN]; char bits_str[32];
     printf("Enter file to test integrity: "); if (!fgets(path, sizeof(path), stdin)) return; path[strcspn(path, "\n")] = 0;
     printf("Enter bits to use (leave empty for latest): "); if (!fgets(bits_str, sizeof(bits_str), stdin)) return;
-    int bits = -1; if (strlen(bits_str) > 1) { int tmp = atoi(bits_str); if (tmp > 0) bits = tmp; }
+    int bits = -1; if (strlen(bits_str) > 1) { long v=safe_strtol(bits_str); if(v>0) bits=(int)v; }
     test_integrity(path, bits);
 }
 
 void handle_test_speed_interactive() {
-    char path[MAX_PATH_LEN]; int min_bits, max_bits;
+    char path[MAX_PATH_LEN]; int min_bits, max_bits; char min_buf[32], max_buf[32];
     printf("Enter file to benchmark: "); if (!fgets(path, sizeof(path), stdin)) return; path[strcspn(path, "\n")] = 0;
-    printf("Enter min bit length: ");
-    if (scanf("%d", &min_bits) != 1) {
-        while (getchar()!='\n') {}
-        printf("Invalid.\n");
-        return;
-    }
-    printf("Enter max bit length: ");
-    if (scanf("%d", &max_bits) != 1) {
-        while (getchar()!='\n') {}
-        printf("Invalid.\n");
-        return;
-    }
-    while (getchar()!='\n') {}
+    printf("Enter min bit length: "); if(!fgets(min_buf,sizeof(min_buf),stdin)) return; long mv=safe_strtol(min_buf); if(mv<=0){printf("Invalid.\n"); return;} min_bits=(int)mv;
+    printf("Enter max bit length: "); if(!fgets(max_buf,sizeof(max_buf),stdin)) return; long xv=safe_strtol(max_buf); if(xv<=0){printf("Invalid.\n"); return;} max_bits=(int)xv;
     test_speed(path, min_bits, max_bits);
 }
 
 void handle_test_bruteforce_interactive() {
-    char path[MAX_PATH_LEN]; int min_bits, max_bits; char limit_str[32];
+    char path[MAX_PATH_LEN]; int min_bits, max_bits; char limit_str[32]; char algo_str[32]; char min_bf[32], max_bf[32];
     printf("Enter sample file path: "); if (!fgets(path, sizeof(path), stdin)) return; path[strcspn(path, "\n")] = 0;
-    printf("Enter min bit length to attempt: ");
-    if (scanf("%d", &min_bits) != 1) { while (getchar()!='\n') {} printf("Invalid.\n"); return; }
-    printf("Enter max bit length to attempt: ");
-    if (scanf("%d", &max_bits) != 1) { while (getchar()!='\n') {} printf("Invalid.\n"); return; }
-    while (getchar()!='\n') {}
+    printf("Enter min bit length to attempt: "); if(!fgets(min_bf,sizeof(min_bf),stdin)) return; long mbfv=safe_strtol(min_bf); if(mbfv<=0){printf("Invalid.\n"); return;} min_bits=(int)mbfv;
+    printf("Enter max bit length to attempt: "); if(!fgets(max_bf,sizeof(max_bf),stdin)) return; long xbfv=safe_strtol(max_bf); if(xbfv<=0){printf("Invalid.\n"); return;} max_bits=(int)xbfv;
     printf("Enter time limit seconds per key (press Enter for default %d): ", LIMIT_SECONDS);
     if (!fgets(limit_str, sizeof(limit_str), stdin)) return;
-    int limit_seconds = LIMIT_SECONDS; if (strlen(limit_str) > 1) { int tmp = atoi(limit_str); if (tmp > 0) limit_seconds = tmp; }
-    test_bruteforce(path, min_bits, max_bits, limit_seconds);
+    int limit_seconds = LIMIT_SECONDS; if (strlen(limit_str) > 1) { long v=safe_strtol(limit_str); if(v>0) limit_seconds=(int)v; }
+    printf("Algorithm (auto|trial|rho|p1) [auto]: "); if (!fgets(algo_str, sizeof(algo_str), stdin)) return; algo_str[strcspn(algo_str, "\n")] = 0;
+    const char *algo = (strlen(algo_str) ? algo_str : "auto");
+    test_bruteforce(path, min_bits, max_bits, limit_seconds, algo);
 }

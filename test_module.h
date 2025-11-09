@@ -12,8 +12,8 @@ int test_integrity(const char *file_path, int bits);
 // Measure encryption/decryption speed across powers-of-two bit lengths in range.
 void test_speed(const char *file_path, int min_bits, int max_bits);
 
-// Attempt to brute force private key(s) for powers-of-two bit lengths in range using factoring of n.
+// Attempt to brute force private key(s) with algorithm selection: "auto" (default), "trial", "rho", "p1".
 // Stops attempt if longer than provided limit_seconds (if <=0 uses LIMIT_SECONDS).
-void test_bruteforce(const char *sample_file, int min_bits, int max_bits, int limit_seconds);
+void test_bruteforce(const char *sample_file, int min_bits, int max_bits, int limit_seconds, const char *algorithm);
 
 #endif // TEST_MODULE_H

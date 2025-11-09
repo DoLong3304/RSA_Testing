@@ -3,7 +3,6 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
-#include <math.h>
 #include <dirent.h>
 #include "rsa.h"
 #include "test_module.h"
@@ -12,6 +11,26 @@
 #define KEYS_DIR "keys"
 #define MAX_PATH 256
 #define LIMIT_SECONDS 600
+
+// Portable monotonic-ish clock wrapper
+#if defined(_WIN32)
+#include <windows.h>
+static void portable_now(struct timespec *ts){
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    unsigned long long ticks = ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime; // 100-ns since 1601
+    const unsigned long long EPOCH_DIFF_100NS = 116444736000000000ULL; // 1970-1601
+    unsigned long long unix100ns = ticks - EPOCH_DIFF_100NS;
+    unsigned long long ns = unix100ns * 100ULL;
+    ts->tv_sec = (time_t)(ns / 1000000000ULL);
+    ts->tv_nsec = (long)(ns % 1000000000ULL);
+}
+#else
+static void portable_now(struct timespec *ts){ clock_gettime(CLOCK_MONOTONIC, ts); }
+#endif
+
+static inline double timespec_diff_sec(const struct timespec *end, const struct timespec *start) {
+    return (double)(end->tv_sec - start->tv_sec) + (double)(end->tv_nsec - start->tv_nsec)/1e9;
+}
 
 static char *sha256_file_hex(const char *path);
 
@@ -48,7 +67,7 @@ int test_integrity(const char *file_path, int bits) {
     // If bits <=0, try to detect latest by scanning keys dir.
     if (bits <= 0) {
         int latest = -1; DIR *d = opendir(KEYS_DIR); if (d) { struct dirent *e; while ((e=readdir(d))) {
-            if (strncmp(e->d_name, "public_", 7)==0) { char *dot=strchr(e->d_name,'.'); if(dot){ int val=atoi(e->d_name+7); if (val>latest) latest=val; } }
+            if (strncmp(e->d_name, "public_", 7)==0) { char *dot=strchr(e->d_name,'.'); if(dot){ long val=strtol(e->d_name+7,NULL,10); if (val>latest) latest=(int)val; } }
         } closedir(d);} bits = latest; }
     if (bits <= 0) { fprintf(stderr, "No key bits resolved.\n"); return -1; }
     char pub_path[MAX_PATH], priv_path[MAX_PATH]; build_key_paths(bits, pub_path, priv_path);
@@ -100,25 +119,25 @@ void test_speed(const char *file_path, int min_bits, int max_bits) {
         save_public_key(pub_path,&pub); save_private_key(priv_path,&priv);
 
         struct timespec ts_enc_start, ts_enc_end, ts_dec_start, ts_dec_end;
-        clock_gettime(CLOCK_MONOTONIC, &ts_enc_start);
+        portable_now(&ts_enc_start);
         if (encrypt_file(file_path, NULL, &pub) != 0) {
             printf("| %7d | %16s | %16s | %18s |\n", bits, "ENCRYPT_FAIL", "-", "-");
             continue;
         }
-        clock_gettime(CLOCK_MONOTONIC, &ts_enc_end);
+        portable_now(&ts_enc_end);
         char enc_path[MAX_PATH]; snprintf(enc_path, MAX_PATH, "%s.dat", file_path);
         struct stat st; long long enc_size = -1; if (stat(enc_path, &st) == 0) enc_size = (long long)st.st_size;
 
-        clock_gettime(CLOCK_MONOTONIC, &ts_dec_start);
+        portable_now(&ts_dec_start);
         if (decrypt_file(enc_path, NULL, &priv) != 0) {
-            double enc_secs = (ts_enc_end.tv_sec - ts_enc_start.tv_sec) + (ts_enc_end.tv_nsec - ts_enc_start.tv_nsec)/1e9;
+            double enc_secs = timespec_diff_sec(&ts_enc_end,&ts_enc_start);
             printf("| %7d | %16.6f | %16s | %18lld |\n", bits, enc_secs, "DECRYPT_FAIL", enc_size);
             continue;
         }
-        clock_gettime(CLOCK_MONOTONIC, &ts_dec_end);
+        portable_now(&ts_dec_end);
 
-        double enc_secs = (ts_enc_end.tv_sec - ts_enc_start.tv_sec) + (ts_enc_end.tv_nsec - ts_enc_start.tv_nsec)/1e9;
-        double dec_secs = (ts_dec_end.tv_sec - ts_dec_start.tv_sec) + (ts_dec_end.tv_nsec - ts_dec_start.tv_nsec)/1e9;
+        double enc_secs = timespec_diff_sec(&ts_enc_end,&ts_enc_start);
+        double dec_secs = timespec_diff_sec(&ts_dec_end,&ts_dec_start);
         printf("| %7d | %16.6f | %16.6f | %18lld |\n", bits, enc_secs, dec_secs, enc_size);
     }
 
@@ -129,27 +148,105 @@ void test_speed(const char *file_path, int min_bits, int max_bits) {
 // Basic trial division factoring (infeasible for large bits, used just for demonstration)
 static int factor_n(const mpz_t n, mpz_t p_out, mpz_t q_out, unsigned long limit_seconds) {
     time_t start = time(NULL);
+    volatile time_t last_check = start; // volatile to silence static analysis on time usage
     mpz_t i, rem; mpz_inits(i, rem, NULL); mpz_set_ui(i,2);
-    while (mpz_cmp(i, n) < 0) {
-        if (difftime(time(NULL), start) > (double)limit_seconds) { mpz_clears(i, rem, NULL); return 0; }
+    int found = 0;
+    while (!found && mpz_cmp(i, n) < 0) {
+        if (difftime(time(NULL), start) > (double)limit_seconds) break;
         mpz_mod(rem, n, i);
-        if (mpz_cmp_ui(rem,0)==0) {
+        if (mpz_cmp_ui(rem,0) == 0) {
             mpz_set(p_out, i);
             mpz_divexact(q_out, n, i);
-            mpz_clears(i, rem, NULL);
-            return 1;
+            found = 1;
+            break;
         }
         mpz_add_ui(i, i, 1);
+        last_check = time(NULL);
     }
-    mpz_clears(i, rem, NULL); return 0;
+    mpz_clears(i, rem, NULL);
+    return found;
 }
 
-void test_bruteforce(const char *sample_file, int min_bits, int max_bits, int limit_seconds) {
+// Pollard's Rho (Floyd cycle detection) - simplified and reliable for demo
+static int pollards_rho_floyd(const mpz_t n, mpz_t p_out, mpz_t q_out, unsigned long limit_seconds) {
+    if (mpz_even_p(n)) { mpz_set_ui(p_out,2); mpz_divexact(q_out,n,p_out); return 1; }
+    gmp_randstate_t st; gmp_randinit_default(st); gmp_randseed_ui(st, (unsigned long)time(NULL));
+    mpz_t x, y, c, d, tmp; mpz_inits(x, y, c, d, tmp, NULL);
+
+    time_t start = time(NULL);
+    int success = 0;
+    while (difftime(time(NULL), start) < (double)limit_seconds && !success) {
+        // randomize parameters
+        mpz_urandomm(x, st, n); // x in [0, n-1]
+        mpz_set(y, x);
+        mpz_urandomm(c, st, n); if (mpz_cmp_ui(c, 1) < 0) mpz_set_ui(c, 1);
+        mpz_set_ui(d, 1);
+        // iterate until factor found or timeout
+        while (mpz_cmp_ui(d,1) == 0 && difftime(time(NULL), start) < (double)limit_seconds) {
+            // x = (x^2 + c) mod n
+            mpz_mul(x, x, x); mpz_add(x, x, c); mpz_mod(x, x, n);
+            // y = f(f(y))
+            mpz_mul(y, y, y); mpz_add(y, y, c); mpz_mod(y, y, n);
+            mpz_mul(y, y, y); mpz_add(y, y, c); mpz_mod(y, y, n);
+            // d = gcd(|x - y|, n)
+            if (mpz_cmp(x, y) > 0) { mpz_sub(tmp, x, y); } else { mpz_sub(tmp, y, x); }
+            mpz_gcd(d, tmp, n);
+        }
+        if (mpz_cmp(d, n) == 0) {
+            // failure for this c/x; retry with new randoms
+            continue;
+        }
+        if (mpz_cmp_ui(d,1) > 0) {
+            mpz_set(p_out, d);
+            mpz_divexact(q_out, n, d);
+            success = 1;
+        }
+    }
+
+    mpz_clears(x, y, c, d, tmp, NULL);
+    gmp_randclear(st);
+    return success;
+}
+
+// Simplified Pollard's p-1
+static int pollards_p_minus_1(const mpz_t n, mpz_t p_out, mpz_t q_out, unsigned long B, unsigned long limit_seconds) {
+    time_t start = time(NULL); volatile time_t touch = start; (void)touch;
+    mpz_t a,g,tmp; mpz_inits(a,g,tmp,NULL);
+    int success = 0;
+    for (int attempt=0; attempt<5 && difftime(time(NULL), start) < (double)limit_seconds && !success; ++attempt) {
+        mpz_set_ui(a,2+attempt);
+        for (unsigned long j=2; j<=B && difftime(time(NULL), start) < (double)limit_seconds; ++j) {
+            mpz_powm_ui(a,a,j,n);
+            touch = time(NULL);
+        }
+        mpz_sub_ui(tmp,a,1);
+        mpz_gcd(g,tmp,n);
+        if (mpz_cmp_ui(g,1)>0 && mpz_cmp(g,n)<0) {
+            mpz_set(p_out,g); mpz_divexact(q_out,n,g); success = 1; break;
+        }
+    }
+    mpz_clears(a,g,tmp,NULL);
+    return success;
+}
+
+// Dispatcher factoring: chooses algorithm strategy
+static int factor_with_algorithm(const mpz_t n, mpz_t p_out, mpz_t q_out, unsigned long limit_seconds, const char *algorithm) {
+    if (mpz_cmp_ui(n,2)<=0) return 0;
+    if (!algorithm) algorithm = "auto";
+    if (strcmp(algorithm,"trial")==0) return factor_n(n,p_out,q_out,limit_seconds);
+    if (strcmp(algorithm,"rho")==0) return pollards_rho_floyd(n,p_out,q_out,limit_seconds);
+    if (strcmp(algorithm,"p1")==0) return pollards_p_minus_1(n,p_out,q_out,50,limit_seconds);
+    if (pollards_p_minus_1(n,p_out,q_out,40,limit_seconds)) return 1;
+    if (pollards_rho_floyd(n,p_out,q_out,limit_seconds)) return 1;
+    return factor_n(n,p_out,q_out,limit_seconds);
+}
+
+void test_bruteforce(const char *sample_file, int min_bits, int max_bits, int limit_seconds, const char *algorithm) {
     if (!sample_file) { fprintf(stderr,"Sample file required.\n"); return; }
     if (limit_seconds <= 0) limit_seconds = LIMIT_SECONDS;
     ensure_keys_dir();
     for (int bits=min_bits; bits<=max_bits; bits <<= 1) {
-        printf("Bruteforce attempt for %d-bit key (limit %d s)...\n", bits, limit_seconds);
+        printf("Bruteforce attempt for %d-bit key (limit %d s, algo %s)...\n", bits, limit_seconds, algorithm?algorithm:"auto");
         // Load or generate key
         char pub_path[MAX_PATH], priv_path[MAX_PATH]; build_key_paths(bits, pub_path, priv_path);
         public_key_t pub; private_key_t priv; init_public_key(&pub); init_private_key(&priv);
@@ -158,30 +255,27 @@ void test_bruteforce(const char *sample_file, int min_bits, int max_bits, int li
             generate_keys(&pub,&priv,bits);
             save_public_key(pub_path,&pub); save_private_key(priv_path,&priv);
         }
-        // Attempt factoring of n with naive trial division up to 600 seconds (10 minutes)
         mpz_t p,q; mpz_inits(p,q,NULL);
-        struct timespec ts_start, ts_end; clock_gettime(CLOCK_MONOTONIC,&ts_start);
-        int success = factor_n(pub.n, p, q, (unsigned long)limit_seconds);
-        clock_gettime(CLOCK_MONOTONIC,&ts_end);
-        double elapsed = (ts_end.tv_sec - ts_start.tv_sec) + (ts_end.tv_nsec - ts_start.tv_nsec)/1e9;
+        struct timespec ts_start, ts_end; portable_now(&ts_start);
+        int success = factor_with_algorithm(pub.n, p, q, (unsigned long)limit_seconds, algorithm);
+        portable_now(&ts_end);
+        double elapsed = timespec_diff_sec(&ts_end,&ts_start);
         if (!success) {
-            printf("Result %d bits: Too long (%.2f s)\n", bits, elapsed);
+            printf("Result %d bits: Too long or failure (%.2f s)\n", bits, elapsed);
             mpz_clears(p,q,NULL);
             clear_public_key(&pub); clear_private_key(&priv);
             continue;
         }
-        // Reconstruct private key and test decrypt
         mpz_t phi, p1, q1, d_calc; mpz_inits(phi,p1,q1,d_calc,NULL);
         mpz_sub_ui(p1,p,1); mpz_sub_ui(q1,q,1); mpz_mul(phi,p1,q1);
         if (mpz_invert(d_calc, pub.e, phi)==0) {
-            printf("Result %d bits: Inversion failed after factoring (%.2f s)\n", bits, elapsed);
+            printf("Result %d bits: Factored but inversion failed (%.2f s)\n", bits, elapsed);
         } else {
-            // Encrypt sample file then decrypt using recovered d to validate
             private_key_t recovered; init_private_key(&recovered); mpz_set(recovered.n, pub.n); mpz_set(recovered.d, d_calc);
             if (encrypt_file(sample_file, NULL, &pub)==0) {
                 char enc_path[MAX_PATH]; snprintf(enc_path, MAX_PATH, "%s.dat", sample_file);
                 if (decrypt_file(enc_path, NULL, &recovered)==0) {
-                    printf("Result %d bits: SUCCESS brute forced in %.2f s\n", bits, elapsed);
+                    printf("Result %d bits: SUCCESS (algo %s) in %.2f s\n", bits, algorithm?algorithm:"auto", elapsed);
                 } else {
                     printf("Result %d bits: Factored but decrypt failed (%.2f s)\n", bits, elapsed);
                 }

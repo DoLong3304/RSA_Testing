@@ -60,9 +60,14 @@ Encrypt then decrypt a target file with a given key size (or the latest). A byte
 Generates temporary keys for each power-of-two bit size in a range; measures encryption and decryption wall-clock time plus the size of the produced ciphertext.
 
 ### 2.6 Naive Brute Force Demo
-Attempts trial division factoring of n (only feasible for tiny key sizes). Each key size attempt is time-limited.
+Attempts factoring of n using selectable algorithms:
+- `auto` (default): tries Pollard’s p−1 (small bounds), then Pollard’s Rho (Floyd), then falls back to trial division.
+- `rho`: Pollard’s Rho with Floyd cycle detection.
+- `p1`: Pollard’s p−1 with small smoothness bound (fast if p−1 is B-smooth).
+- `trial`: naive trial division (slow, worst case).
+Each key size attempt is time-limited.
 - Default per-key time limit: `LIMIT_SECONDS` (defined in `test_module.h`, default 600 seconds).
-- You can override the time limit when running via CLI or interactive mode (details below).
+- You can override via CLI or interactive mode (details below).
 - On success, reconstruct φ and d, then verify by decrypting a test sample; otherwise prints a timeout result.
 
 ### 2.7 Security Notes
@@ -258,15 +263,22 @@ Outputs PASS/FAIL and prints SHA-256 of original & decrypted.
 Produces a timing table.
 
 ### 8.8 Brute Force Demonstration (ONLY Tiny Keys)
-Default (uses `LIMIT_SECONDS` from `test_module.h`, 600s by default):
+Default (uses `LIMIT_SECONDS` from `test_module.h`, 600s by default) and automatic algorithm selection (p-1, then rho, then trial):
 ```
 ./rsa_tool test bruteforce docs/small.txt 64 128
 ```
-Custom time limit per key (e.g., 30 seconds):
+Custom time limit per key (e.g., 30 seconds) and explicit algorithm:
 ```
-./rsa_tool test bruteforce docs/small.txt 64 128 30
+# Use Pollard's Rho
+./rsa_tool test bruteforce docs/small.txt 64 128 30 rho
+
+# Use Pollard's p-1
+./rsa_tool test bruteforce docs/small.txt 64 128 30 p1
+
+# Force naive trial division (for comparison)
+./rsa_tool test bruteforce docs/small.txt 64 128 30 trial
 ```
-Attempts naive factoring. Likely succeeds for 64-bit; times out for larger sizes.
+In interactive mode, you can also pick the algorithm (auto|trial|rho|p1) and time limit when prompted.
 
 ### 8.9 Interactive Mode
 Run:
